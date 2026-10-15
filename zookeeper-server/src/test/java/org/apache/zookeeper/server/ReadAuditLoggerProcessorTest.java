@@ -48,6 +48,7 @@ import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.data.Stat;
+import org.apache.zookeeper.metrics.MetricsUtils;
 import org.apache.zookeeper.proto.CheckVersionRequest;
 import org.apache.zookeeper.proto.GetDataRequest;
 import org.apache.zookeeper.proto.MultiHeader;
@@ -149,6 +150,7 @@ public class ReadAuditLoggerProcessorTest {
 
     @Test
     public void testStalledDiskDropsAndCountsWithoutBlockingRequests() throws Exception {
+        ServerMetrics.getMetrics().resetAll();
         ReadAuditLogger.configure(true, "", 0, ReadAuditLogger.AggregateBy.SESSION, 10000, 5);
         ch.qos.logback.classic.Logger audit =
                 (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(ReadAuditLogger.LOGGER_NAME);
@@ -184,11 +186,67 @@ public class ReadAuditLoggerProcessorTest {
             assertEquals(lines.toString(), 6, requestLines);
             assertEquals(lines.toString(), 1, dropped.size());
             assertTrue(dropped.get(0), dropped.get(0).matches("event=dropped count=14 since=\\S+ until=\\S+"));
+            // the metrics agree: 6 lines handed to the logger, 14 dropped
+            assertEquals(6, metric("read_audit_lines"));
+            assertEquals(14, metric("read_audit_dropped"));
         } finally {
             stalled.release.countDown();
             audit.detachAppender(stalled);
             audit.setLevel(originalLevel);
         }
+    }
+
+    private static long metric(String name) throws InterruptedException {
+        assertTrue(ReadAuditLogger.awaitDrained(10_000));
+        Object v = MetricsUtils.currentServerMetrics().get(name);
+        return v == null ? 0 : ((Number) v).longValue();
+    }
+
+    @Test
+    public void testMetricsCountLinesAndHookSamples() throws Exception {
+        ServerMetrics.getMetrics().resetAll();
+        ReadAuditLogger.configure(true, "", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+        processor.processRequest(request(OpCode.getData, serialize(new GetDataRequest("/app", false))));
+        processor.processRequest(request(OpCode.getData, serialize(new GetDataRequest("/app", true))));
+        assertEquals(2, metric("read_audit_lines"));
+        assertEquals(2, metric("cnt_read_audit_hook_time_us"));
+        assertEquals(0, metric("read_audit_dropped"));
+        assertTrue(metric("max_read_audit_hook_time_us") >= 0);
+        // delivering a watch is not audited, so it adds neither a line nor a sample
+        triggerAll(new WatchManager());
+        assertEquals(2, metric("read_audit_lines"));
+        assertEquals(2, metric("cnt_read_audit_hook_time_us"));
+    }
+
+    @Test
+    public void testFilteredRequestIsTimedButNotCounted() throws Exception {
+        ServerMetrics.getMetrics().resetAll();
+        ReadAuditLogger.configure(true, "/other", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+        processor.processRequest(request(OpCode.getData, serialize(new GetDataRequest("/app", false))));
+        assertEquals(0, metric("read_audit_lines"));
+        assertEquals(1, metric("cnt_read_audit_hook_time_us"));
+    }
+
+    @Test
+    public void testAggregatedLinesAreCountedWhenFlushed() throws Exception {
+        ServerMetrics.getMetrics().resetAll();
+        ReadAuditLogger.configure(true, "", 3_600_000, ReadAuditLogger.AggregateBy.SESSION, 10000);
+        for (int i = 0; i < 3; i++) {
+            processor.processRequest(request(OpCode.getData, serialize(new GetDataRequest("/app", false))));
+        }
+        assertEquals(0, metric("read_audit_lines"));
+        assertEquals(3, metric("cnt_read_audit_hook_time_us"));
+        ReadAuditLogger.flush();
+        assertEquals(1, metric("read_audit_lines"));
+    }
+
+    @Test
+    public void testDisabledRecordsNoMetrics() throws Exception {
+        ServerMetrics.getMetrics().resetAll();
+        ReadAuditLogger.configure(false, "", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+        processor.processRequest(request(OpCode.getData, serialize(new GetDataRequest("/app", false))));
+        assertEquals(0, metric("read_audit_lines"));
+        assertEquals(0, metric("cnt_read_audit_hook_time_us"));
     }
 
     @Test

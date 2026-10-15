@@ -73,6 +73,10 @@ import org.slf4j.LoggerFactory;
  * lost. Use a plain file appender: wrapping it in Logback's async appender only adds a second
  * buffer.
  *
+ * <p>Metrics: {@code read_audit_lines} counts lines handed to the logger, {@code read_audit_dropped}
+ * counts lines dropped because the queue was full, and {@code read_audit_hook_time_us} records the
+ * time request threads spend in the audit hook.
+ *
  * <p>Uses the dedicated logger name {@value #LOGGER_NAME} so it can be routed to its own appender.
  * The logger must be at INFO or finer: routing it at WARN or above turns the audit off even when
  * {@code enabled=true}. A status line in the main server log states whether the audit is active.
@@ -509,27 +513,32 @@ public final class ReadAuditLogger {
         if (!c.enabled || !LOG.isInfoEnabled() || !isReadOrWatchOp(request.type)) {
             return;
         }
-        if (entries == null || (entries.isEmpty() && err != Code.OK)) {
-            // a failure with no known path, e.g. SESSIONMOVED or a malformed request, is always logged
-            boolean unknownPathFailure = path == null && err != Code.OK;
-            if (!unknownPathFailure && !inScope(c.prefixes, path, requestScope(request.type, detail))) {
+        long hookStart = System.nanoTime();
+        try {
+            if (entries == null || (entries.isEmpty() && err != Code.OK)) {
+                // a failure with no known path, e.g. SESSIONMOVED or a malformed request, is always logged
+                boolean unknownPathFailure = path == null && err != Code.OK;
+                if (!unknownPathFailure && !inScope(c.prefixes, path, requestScope(request.type, detail))) {
+                    return;
+                }
+                record(c, "request", entity(c, request.sessionId, cnxn, request.getUsers()),
+                        opName(request.type), path, detail, err.name());
                 return;
             }
-            record(c, "request", entity(c, request.sessionId, cnxn, request.getUsers()),
-                    opName(request.type), path, detail, err.name());
-            return;
-        }
-        String entity = null;
-        for (Entry e : entries) {
-            if (!inScope(c.prefixes, e.path, entryScope(e.detail))) {
-                continue;
+            String entity = null;
+            for (Entry e : entries) {
+                if (!inScope(c.prefixes, e.path, entryScope(e.detail))) {
+                    continue;
+                }
+                if (entity == null) {
+                    entity = entity(c, request.sessionId, cnxn, request.getUsers());
+                }
+                // when the whole request failed the client received nothing, so every path gets that error
+                Code result = err != Code.OK || e.result == null ? err : e.result;
+                record(c, "request", entity, e.op, e.path, e.detail, result.name());
             }
-            if (entity == null) {
-                entity = entity(c, request.sessionId, cnxn, request.getUsers());
-            }
-            // when the whole request failed the client received nothing, so every path gets that error
-            Code result = err != Code.OK || e.result == null ? err : e.result;
-            record(c, "request", entity, e.op, e.path, e.detail, result.name());
+        } finally {
+            ServerMetrics.getMetrics().READ_AUDIT_HOOK_TIME.add((System.nanoTime() - hookStart) / 1000);
         }
     }
 
@@ -598,6 +607,7 @@ public final class ReadAuditLogger {
 
     private static void countDrop() {
         DROPPED.increment();
+        ServerMetrics.getMetrics().READ_AUDIT_DROPPED.add(1);
         FIRST_DROP.compareAndSet(0, System.currentTimeMillis());
     }
 
@@ -619,6 +629,7 @@ public final class ReadAuditLogger {
                 if (line != null) {
                     try {
                         LOG.info(line);
+                        ServerMetrics.getMetrics().READ_AUDIT_LINES.add(1);
                     } finally {
                         PENDING.decrementAndGet();
                     }
