@@ -106,6 +106,7 @@ public class FinalRequestProcessor implements RequestProcessor {
     public FinalRequestProcessor(ZooKeeperServer zks) {
         this.zks = zks;
         this.requestPathMetricsCollector = zks.getRequestPathMetricsCollector();
+        ReadAuditLogger.init();
     }
 
     public void processRequest(Request request) {
@@ -167,6 +168,10 @@ public class FinalRequestProcessor implements RequestProcessor {
         Code err = Code.OK;
         Record rsp = null;
         String path = null;
+        // POC read/watch audit: extra per-op detail and path for ops that don't set 'path'
+        String readAuditPath = null;
+        String readAuditDetail = null;
+        List<ReadAuditLogger.Entry> readAuditEntries = null;
         try {
             if (request.getHdr() != null && request.getHdr().getType() == OpCode.error) {
                 AuditHelper.addAuditLog(request, rc, true);
@@ -263,6 +268,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 ByteBufferInputStream.byteBuffer2Record(request.request, multiReadRecord);
                 rsp = new MultiResponse();
                 OpResult subResult;
+                readAuditEntries = ReadAuditLogger.isEnabled() ? new ArrayList<>() : null;
                 for (Op readOp : multiReadRecord) {
                     try {
                         Record rec;
@@ -281,6 +287,11 @@ public class FinalRequestProcessor implements RequestProcessor {
                         }
                     } catch (KeeperException e) {
                         subResult = new ErrorResult(e.code().intValue());
+                    }
+                    if (readAuditEntries != null) {
+                        readAuditEntries.add(new ReadAuditLogger.Entry(
+                                "multiRead." + Request.op2String(readOp.getType()), readOp.getPath(), null,
+                                subResult instanceof ErrorResult ? Code.get(((ErrorResult) subResult).getErr()) : Code.OK));
                     }
                     ((MultiResponse) rsp).add(subResult);
                 }
@@ -356,6 +367,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 ExistsRequest existsRequest = new ExistsRequest();
                 ByteBufferInputStream.byteBuffer2Record(request.request, existsRequest);
                 path = existsRequest.getPath();
+                readAuditDetail = ReadAuditLogger.watchDetail(existsRequest.getWatch());
                 if (path.indexOf('\0') != -1) {
                     throw new KeeperException.BadArgumentsException();
                 }
@@ -369,6 +381,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 GetDataRequest getDataRequest = new GetDataRequest();
                 ByteBufferInputStream.byteBuffer2Record(request.request, getDataRequest);
                 path = getDataRequest.getPath();
+                readAuditDetail = ReadAuditLogger.watchDetail(getDataRequest.getWatch());
                 rsp = handleGetDataRequest(getDataRequest, request);
                 requestPathMetricsCollector.registerRequest(request.type, path);
                 break;
@@ -380,6 +393,11 @@ public class FinalRequestProcessor implements RequestProcessor {
                 request.request.rewind();
                 ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
                 long relativeZxid = setWatches.getRelativeZxid();
+                if (ReadAuditLogger.isEnabled()) {
+                    readAuditEntries = ReadAuditLogger.setWatchesEntries("setWatches",
+                            setWatches.getDataWatches(), setWatches.getExistWatches(), setWatches.getChildWatches(),
+                            Collections.emptyList(), Collections.emptyList());
+                }
                 zks.getZKDatabase()
                    .setWatches(
                        relativeZxid,
@@ -398,6 +416,11 @@ public class FinalRequestProcessor implements RequestProcessor {
                 request.request.rewind();
                 ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
                 long relativeZxid = setWatches.getRelativeZxid();
+                if (ReadAuditLogger.isEnabled()) {
+                    readAuditEntries = ReadAuditLogger.setWatchesEntries("setWatches2",
+                            setWatches.getDataWatches(), setWatches.getExistWatches(), setWatches.getChildWatches(),
+                            setWatches.getPersistentWatches(), setWatches.getPersistentRecursiveWatches());
+                }
                 zks.getZKDatabase().setWatches(relativeZxid,
                         setWatches.getDataWatches(),
                         setWatches.getExistWatches(),
@@ -412,6 +435,8 @@ public class FinalRequestProcessor implements RequestProcessor {
                 AddWatchRequest addWatcherRequest = new AddWatchRequest();
                 ByteBufferInputStream.byteBuffer2Record(request.request,
                         addWatcherRequest);
+                readAuditPath = addWatcherRequest.getPath();
+                readAuditDetail = ReadAuditLogger.watchModeDetail(addWatcherRequest.getMode());
                 zks.getZKDatabase().addWatch(addWatcherRequest.getPath(), cnxn, addWatcherRequest.getMode());
                 rsp = new ErrorResponse(0);
                 break;
@@ -463,6 +488,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 GetChildrenRequest getChildrenRequest = new GetChildrenRequest();
                 ByteBufferInputStream.byteBuffer2Record(request.request, getChildrenRequest);
                 path = getChildrenRequest.getPath();
+                readAuditDetail = ReadAuditLogger.watchDetail(getChildrenRequest.getWatch());
                 rsp = handleGetChildrenRequest(getChildrenRequest, request);
                 requestPathMetricsCollector.registerRequest(request.type, path);
                 break;
@@ -492,6 +518,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 ByteBufferInputStream.byteBuffer2Record(request.request, getChildren2Request);
                 Stat stat = new Stat();
                 path = getChildren2Request.getPath();
+                readAuditDetail = ReadAuditLogger.watchDetail(getChildren2Request.getWatch());
                 DataNode n = zks.getZKDatabase().getNode(path);
                 if (n == null) {
                     throw new KeeperException.NoNodeException();
@@ -514,6 +541,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 ByteBufferInputStream.byteBuffer2Record(request.request, checkWatches);
                 WatcherType type = WatcherType.fromInt(checkWatches.getType());
                 path = checkWatches.getPath();
+                readAuditDetail = ReadAuditLogger.watcherTypeDetail(type);
                 boolean containsWatcher = zks.getZKDatabase().containsWatcher(path, type, cnxn);
                 if (!containsWatcher) {
                     String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
@@ -528,6 +556,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 ByteBufferInputStream.byteBuffer2Record(request.request, removeWatches);
                 WatcherType type = WatcherType.fromInt(removeWatches.getType());
                 path = removeWatches.getPath();
+                readAuditDetail = ReadAuditLogger.watcherTypeDetail(type);
                 boolean removed = zks.getZKDatabase().removeWatch(path, type, cnxn);
                 if (!removed) {
                     String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
@@ -541,6 +570,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                 GetEphemeralsRequest getEphemerals = new GetEphemeralsRequest();
                 ByteBufferInputStream.byteBuffer2Record(request.request, getEphemerals);
                 String prefixPath = getEphemerals.getPrefixPath();
+                readAuditPath = prefixPath;
                 Set<String> allEphems = zks.getZKDatabase().getDataTree().getEphemerals(request.sessionId);
                 List<String> ephemerals = new ArrayList<>();
                 if (prefixPath == null || prefixPath.trim().isEmpty() || "/".equals(prefixPath.trim())) {
@@ -562,6 +592,7 @@ public class FinalRequestProcessor implements RequestProcessor {
                         getChildrenPaginatedRequest);
                 Stat stat = new Stat();
                 path = getChildrenPaginatedRequest.getPath();
+                readAuditDetail = ReadAuditLogger.watchDetail(getChildrenPaginatedRequest.getWatch());
                 DataNode n = zks.getZKDatabase().getNode(path);
                 if (n == null) {
                     throw new KeeperException.NoNodeException();
@@ -594,6 +625,8 @@ public class FinalRequestProcessor implements RequestProcessor {
             // successfully fwd/processed by the leader and as a result
             // the client and leader disagree on where the client is most
             // recently attached (and therefore invalid SESSION MOVED generated)
+            ReadAuditLogger.logRequest(request, cnxn, path != null ? path : readAuditPath, readAuditDetail,
+                    readAuditEntries, Code.SESSIONMOVED);
             cnxn.sendCloseSession();
             return;
         } catch (KeeperException e) {
@@ -613,6 +646,9 @@ public class FinalRequestProcessor implements RequestProcessor {
         }
 
         ReplyHeader hdr = new ReplyHeader(request.cxid, lastZxid, err.intValue());
+
+        ReadAuditLogger.logRequest(request, cnxn, path != null ? path : readAuditPath, readAuditDetail,
+                readAuditEntries, err);
 
         int type = request.type;
         if (type == OpCode.multi) {
