@@ -18,7 +18,7 @@
 
 package org.apache.zookeeper.server;
 
-import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -96,50 +96,29 @@ public class ReadAuditLoggerProcessorTest {
         return w;
     }
 
-    private static void checkManager(IWatchManager manager) throws Exception {
-        ReadAuditLogger.configure(true, "/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+    private static void triggerAll(IWatchManager manager) {
+        manager.addWatch("/app", watcher(0x1));
+        manager.addWatch("/app", watcher(0x2));
+        manager.triggerWatch("/app", Watcher.Event.EventType.NodeDataChanged);
+    }
+
+    @Test
+    public void testWatchDeliveryIsNotLogged() throws Exception {
+        ReadAuditLogger.configure(true, "", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
         try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.LOGGER_NAME)) {
-            manager.addWatch("/app", watcher(0x1));
-            manager.addWatch("/app", watcher(0x2));
-            manager.addWatch("/app", watcher(0x3));
-            manager.addWatch("/other", watcher(0x4));
-            manager.triggerWatch("/app", Watcher.Event.EventType.NodeDataChanged);
-            manager.triggerWatch("/other", Watcher.Event.EventType.NodeDataChanged);
-            String out = tool.getOutputStream().toString();
-            assertTrue(out, out.contains("event=watchFired path=/app type=NodeDataChanged trigger=write watchers=3 readers="));
-            for (String sid : new String[]{"0x1/unknown/", "0x2/unknown/", "0x3/unknown/"}) {
-                assertTrue(out, out.contains(sid));
+            triggerAll(new WatchManager());
+            WatchManagerOptimized optimized = new WatchManagerOptimized();
+            try {
+                triggerAll(optimized);
+            } finally {
+                optimized.shutdown();
             }
-            assertFalse(out, out.contains("/other"));
-        }
-    }
-
-    @Test
-    public void testWatchManagerLogsOneSummaryPerTrigger() throws Exception {
-        checkManager(new WatchManager());
-    }
-
-    @Test
-    public void testOptimizedWatchManagerLogsOneSummaryPerTrigger() throws Exception {
-        WatchManagerOptimized manager = new WatchManagerOptimized();
-        try {
-            checkManager(manager);
-        } finally {
-            manager.shutdown();
-        }
-    }
-
-    @Test
-    public void testMissedEventOnReconnectIsLogged() throws Exception {
-        ReadAuditLogger.configure(true, "/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
-        try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.LOGGER_NAME)) {
+            // events a reconnecting client missed are delivered by setWatches, also without a line
             DataTree tree = new DataTree();
             tree.createNode("/app", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, 0, 1, 5, 1);
-            // the client last saw zxid 1, and /app changed at zxid 5 while it was away
             tree.setWatches(1, Collections.singletonList("/app"), Collections.emptyList(), Collections.emptyList(),
                     Collections.emptyList(), Collections.emptyList(), watcher(0x9));
-            String out = tool.getOutputStream().toString();
-            assertTrue(out, out.contains("event=watchFired path=/app type=NodeDataChanged trigger=reconnect watchers=1 readers=0x9/unknown/"));
+            assertEquals("", tool.getOutputStream().toString());
         }
     }
 

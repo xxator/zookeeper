@@ -109,8 +109,8 @@ public class ReadAuditLoggerQuorumTest extends QuorumBase {
                 // exactly once per read: the leader must not log reads served by a learner
                 assertEquals(20, ReadAuditLoggerTest.countLines(reads, "op=getData path=/app watch=false result=OK"));
                 assertEquals(1, ReadAuditLoggerTest.countLines(reads, "op=getData path=/app watch=true result=OK"));
-                assertEquals(1, ReadAuditLoggerTest.countLines(
-                        ReadAuditLoggerTest.grepLines(out, "event=watchFired"), "readers=0x" + Long.toHexString(reader.getSessionId()) + "/"));
+                // the notification was delivered, but notifications are not logged
+                assertEquals(0, ReadAuditLoggerTest.countLines(out, "event=watchFired"));
                 // the writer's session is on the leader and wrote only, so it never appears
                 assertEquals(0, ReadAuditLoggerTest.countLines(out, "session=0x" + Long.toHexString(writer.getSessionId())));
             } finally {

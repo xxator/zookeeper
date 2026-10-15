@@ -31,7 +31,6 @@ import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.Watcher.Event.EventType;
 import org.apache.zookeeper.Watcher.Event.KeeperState;
-import org.apache.zookeeper.server.ReadAuditLogger;
 import org.apache.zookeeper.server.ServerCnxn;
 import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.util.BitHashSet;
@@ -217,7 +216,6 @@ public class WatchManagerOptimized implements IWatchManager, IDeadWatcherListene
         }
 
         int triggeredWatches = 0;
-        ReadAuditLogger.WatchFiredSummary audit = ReadAuditLogger.watchFired(path, type);
 
         // Avoid race condition between dead watcher cleaner in
         // WatcherCleaner and iterating here
@@ -236,13 +234,7 @@ public class WatchManagerOptimized implements IWatchManager, IDeadWatcherListene
 
                 w.process(e);
                 triggeredWatches++;
-                if (audit != null) {
-                    audit.add(w);
-                }
             }
-        }
-        if (audit != null) {
-            audit.finish();
         }
 
         updateMetrics(type, triggeredWatches);
