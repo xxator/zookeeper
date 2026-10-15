@@ -107,7 +107,7 @@ public class ReadAuditLoggerTest extends ClientBase {
                 String out = waitFor(tool, "op=addWatch path=/ watchMode=PERSISTENT_RECURSIVE");
                 // give the two writes time to fire the watches; notifications must not be logged
                 Thread.sleep(300);
-                out = tool.getOutputStream().toString();
+                out = out(tool);
                 System.out.println("==== READ AUDIT LOG (prefix /app) ====\n" + out + "==== END ====");
 
                 assertTrue(out.contains("op=getData path=/app watch=false result=OK"));
@@ -140,7 +140,7 @@ public class ReadAuditLoggerTest extends ClientBase {
                 startServer();
                 String out = waitFor(tool, "op=setWatches path=/app watchType=data");
                 Thread.sleep(200);
-                assertFalse(tool.getOutputStream().toString().contains("/other"));
+                assertFalse(out(tool).contains("/other"));
             } finally {
                 zk.close();
             }
@@ -166,10 +166,10 @@ public class ReadAuditLoggerTest extends ClientBase {
                 zk1.getData("/app", true, null);
                 zk2.setData("/app", new byte[1], -1);
                 Thread.sleep(300);
-                assertEquals("nothing is logged before the window closes", "", tool.getOutputStream().toString());
+                assertEquals("nothing is logged before the window closes", "", out(tool));
 
                 ReadAuditLogger.flush();
-                String out = tool.getOutputStream().toString();
+                String out = out(tool);
                 System.out.println("==== READ AUDIT LOG (aggregate by session) ====\n" + out + "==== END ====");
                 String s1 = "session=0x" + Long.toHexString(zk1.getSessionId());
                 String s2 = "session=0x" + Long.toHexString(zk2.getSessionId());
@@ -201,7 +201,7 @@ public class ReadAuditLoggerTest extends ClientBase {
                     zk2.getData("/app", false, null);
                 }
                 ReadAuditLogger.flush();
-                String out = tool.getOutputStream().toString();
+                String out = out(tool);
                 System.out.println("==== READ AUDIT LOG (aggregate by user) ====\n" + out + "==== END ====");
                 String line = grepLines(out, "op=getData path=/app");
                 assertEquals(1, countLines(out, "op=getData path=/app"));
@@ -224,10 +224,10 @@ public class ReadAuditLoggerTest extends ClientBase {
                 for (int i = 0; i < 5; i++) {
                     zk.exists("/n" + i, false);
                 }
-                String before = tool.getOutputStream().toString();
+                String before = out(tool);
                 assertEquals(3, countLines(before, "event=request"));
                 ReadAuditLogger.flush();
-                String out = tool.getOutputStream().toString();
+                String out = out(tool);
                 assertEquals(2, countLines(out, "event=aggregate "));
                 assertTrue(out.contains("event=aggregateOverflow"));
                 assertTrue(out.contains("individuallyLogged=3"));
@@ -297,7 +297,7 @@ public class ReadAuditLoggerTest extends ClientBase {
             for (ZooKeeper zk : zks) {
                 zk.close();
             }
-            String out = tool.getOutputStream().toString();
+            String out = out(tool);
             long total = sumReads(out, "op=getData path=/app/c ");
             System.out.println("==== concurrency: aggregate lines=" + countLines(out, "event=aggregate ")
                     + " individual lines=" + countLines(out, "event=request ")
@@ -357,7 +357,7 @@ public class ReadAuditLoggerTest extends ClientBase {
                 assertTrue(appChildren.await(10, TimeUnit.SECONDS));
                 assertTrue(rootChildren.await(10, TimeUnit.SECONDS));
                 Thread.sleep(300);
-                String out = tool.getOutputStream().toString();
+                String out = out(tool);
                 System.out.println("==== READ AUDIT LOG (prefix /app/x, parent scope) ====\n" + out + "==== END ====");
 
                 // a child watch on /app reports creation and deletion of /app/x
@@ -383,12 +383,12 @@ public class ReadAuditLoggerTest extends ClientBase {
         ch.qos.logback.classic.Level original = auditLogger.getLevel();
         try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.class)) {
             enable("/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
-            String out = tool.getOutputStream().toString();
+            String out = out(tool);
             assertTrue(out, out.contains("Read audit log active: logger=" + ReadAuditLogger.LOGGER_NAME + " pathPrefixes=[/app]"));
 
             auditLogger.setLevel(ch.qos.logback.classic.Level.WARN);
             enable("/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
-            out = tool.getOutputStream().toString();
+            out = out(tool);
             assertTrue(out, out.contains("is not at INFO, so nothing will be logged"));
             assertFalse(ReadAuditLogger.isEnabled());
         } finally {
@@ -426,7 +426,7 @@ public class ReadAuditLoggerTest extends ClientBase {
                 // every reader got both notifications
                 assertTrue(delivered.await(10, TimeUnit.SECONDS));
                 Thread.sleep(300);
-                String out = tool.getOutputStream().toString();
+                String out = out(tool);
                 // the readers are identified by their registrations, and the deliveries add nothing
                 assertEquals(3, countLines(out, "op=addWatch path=/app watchMode=PERSISTENT result=OK"));
                 for (ZooKeeper r : readers) {
@@ -458,6 +458,12 @@ public class ReadAuditLoggerTest extends ClientBase {
                 zk.close();
             }
         }
+    }
+
+    /** Output once the audit writer thread has handed every queued line to Logback. */
+    static String out(LoggerTestTool tool) throws InterruptedException {
+        assertTrue("audit writer did not drain", ReadAuditLogger.awaitDrained(10_000));
+        return tool.getOutputStream().toString();
     }
 
     static String waitFor(LoggerTestTool tool, String needle) throws InterruptedException {
@@ -590,7 +596,7 @@ public class ReadAuditLoggerTest extends ClientBase {
             } finally {
                 zk.close();
             }
-            assertEquals("", tool.getOutputStream().toString());
+            assertEquals("", out(tool));
         }
     }
 }

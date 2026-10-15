@@ -26,10 +26,12 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -57,8 +59,19 @@ import org.slf4j.LoggerFactory;
  *   grouped by. {@code session} keys on session id + client address + user, {@code user} keys on
  *   authenticated user + client IP, merging that client's sessions.</li>
  *   <li>{@code zookeeper.readAuditLog.aggregateMaxKeys} (default 10000): bound on distinct groups
- *   held per window. Events past the bound are logged individually so nothing is lost.</li>
+ *   held per window. Events past the bound are logged individually instead of being folded.</li>
+ *   <li>{@code zookeeper.readAuditLog.queueSize} (default 10000): lines buffered between request
+ *   threads and the writer thread. When it is full, lines are dropped, counted, and reported with
+ *   an {@code event=dropped} line.</li>
  * </ul>
+ *
+ * <p>Request threads never write to Logback. Every line goes onto a bounded queue with a
+ * non-blocking offer, and one daemon writer thread hands the lines to Logback. A slow or stalled
+ * disk therefore never delays reads or writes: once the queue is full, new lines are dropped and
+ * counted, and the writer logs {@code event=dropped count=N since=... until=...} when it catches up,
+ * or at least once a second while drops continue. Lines still queued when the process exits are
+ * lost. Use a plain file appender: wrapping it in Logback's async appender only adds a second
+ * buffer.
  *
  * <p>Uses the dedicated logger name {@value #LOGGER_NAME} so it can be routed to its own appender.
  * The logger must be at INFO or finer: routing it at WARN or above turns the audit off even when
@@ -89,6 +102,8 @@ public final class ReadAuditLogger {
     public static final String AGGREGATE_WINDOW_MS_PROPERTY = "zookeeper.readAuditLog.aggregateWindowMs";
     public static final String AGGREGATE_BY_PROPERTY = "zookeeper.readAuditLog.aggregateBy";
     public static final String AGGREGATE_MAX_KEYS_PROPERTY = "zookeeper.readAuditLog.aggregateMaxKeys";
+    public static final String QUEUE_SIZE_PROPERTY = "zookeeper.readAuditLog.queueSize";
+    static final int DEFAULT_QUEUE_SIZE = 10000;
 
     private static final Logger LOG = LoggerFactory.getLogger(LOGGER_NAME);
     private static final Logger INTERNAL_LOG = LoggerFactory.getLogger(ReadAuditLogger.class);
@@ -146,13 +161,15 @@ public final class ReadAuditLogger {
         final long windowMs;
         final AggregateBy aggregateBy;
         final int maxKeys;
+        final int queueSize;
 
-        Config(boolean enabled, List<String> prefixes, long windowMs, AggregateBy aggregateBy, int maxKeys) {
+        Config(boolean enabled, List<String> prefixes, long windowMs, AggregateBy aggregateBy, int maxKeys, int queueSize) {
             this.enabled = enabled;
             this.prefixes = prefixes;
             this.windowMs = windowMs;
             this.aggregateBy = aggregateBy;
             this.maxKeys = maxKeys;
+            this.queueSize = queueSize;
         }
     }
 
@@ -205,6 +222,14 @@ public final class ReadAuditLogger {
     }
 
     private static volatile Config config = fromSystemProperties();
+
+    // Lines between request threads and the writer thread. Request threads only ever offer to it.
+    private static volatile ArrayBlockingQueue<String> queue = new ArrayBlockingQueue<>(config.queueSize);
+    // Lines accepted but not yet handed to Logback, so tests can wait for the writer to catch up.
+    private static final AtomicInteger PENDING = new AtomicInteger();
+    private static final LongAdder DROPPED = new LongAdder();
+    private static final AtomicLong FIRST_DROP = new AtomicLong();
+    private static volatile Thread writer;
 
     // Writers share the read lock; flush takes the write lock only to swap the map, so no count is lost.
     private static final ReadWriteLock SWAP_LOCK = new ReentrantReadWriteLock();
@@ -259,7 +284,8 @@ public final class ReadAuditLogger {
                 parsePrefixes(System.getProperty(PATH_PREFIXES_PROPERTY, "")),
                 Long.getLong(AGGREGATE_WINDOW_MS_PROPERTY, 0L),
                 by,
-                Integer.getInteger(AGGREGATE_MAX_KEYS_PROPERTY, 10000));
+                Integer.getInteger(AGGREGATE_MAX_KEYS_PROPERTY, 10000),
+                Math.max(1, Integer.getInteger(QUEUE_SIZE_PROPERTY, DEFAULT_QUEUE_SIZE)));
     }
 
     static List<String> parsePrefixes(String value) {
@@ -285,12 +311,35 @@ public final class ReadAuditLogger {
     }
 
     /** Replaces the configuration. Flushes what the old configuration aggregated. Visible for testing. */
-    static synchronized void configure(boolean enabled, String prefixes, long windowMs, AggregateBy by, int maxKeys) {
+    static void configure(boolean enabled, String prefixes, long windowMs, AggregateBy by, int maxKeys) {
+        configure(enabled, prefixes, windowMs, by, maxKeys, DEFAULT_QUEUE_SIZE);
+    }
+
+    /** Replaces the configuration, including the queue size. Visible for testing. */
+    static synchronized void configure(boolean enabled, String prefixes, long windowMs, AggregateBy by, int maxKeys,
+                                       int queueSize) {
         stopFlusher();
         flush();
-        config = new Config(enabled, parsePrefixes(prefixes), windowMs, by, maxKeys);
+        config = new Config(enabled, parsePrefixes(prefixes), windowMs, by, maxKeys, Math.max(1, queueSize));
+        resizeQueue(config.queueSize);
         logStatus(config);
         startFlusher(config);
+    }
+
+    private static void resizeQueue(int capacity) {
+        ArrayBlockingQueue<String> old = queue;
+        if (old.size() + old.remainingCapacity() == capacity) {
+            return;
+        }
+        ArrayBlockingQueue<String> resized = new ArrayBlockingQueue<>(capacity);
+        queue = resized;
+        String line;
+        while ((line = old.poll()) != null) {
+            if (!resized.offer(line)) {
+                PENDING.decrementAndGet();
+                countDrop();
+            }
+        }
     }
 
     private static void logStatus(Config c) {
@@ -301,8 +350,8 @@ public final class ReadAuditLogger {
                     + " Set that logger to INFO in the logback configuration.", LOGGER_NAME);
         } else {
             INTERNAL_LOG.info("Read audit log active: logger={} pathPrefixes={} aggregateWindowMs={} aggregateBy={}"
-                    + " aggregateMaxKeys={}", LOGGER_NAME,
-                    c.prefixes.isEmpty() ? "all" : c.prefixes, c.windowMs, c.aggregateBy, c.maxKeys);
+                    + " aggregateMaxKeys={} queueSize={}", LOGGER_NAME,
+                    c.prefixes.isEmpty() ? "all" : c.prefixes, c.windowMs, c.aggregateBy, c.maxKeys, c.queueSize);
         }
     }
 
@@ -508,7 +557,7 @@ public final class ReadAuditLogger {
 
     private static void record(Config c, String event, String entity, String op, String path, String detail, String result) {
         if (c.windowMs <= 0) {
-            LOG.info(format(event, entity, op, path, detail, result, null));
+            emit(format(event, entity, op, path, detail, result, null));
             return;
         }
         Key key = new Key(event, entity, op, path, detail, result);
@@ -521,7 +570,7 @@ public final class ReadAuditLogger {
                 if (w.size() >= c.maxKeys) {
                     // Window is full of distinct groups: keep the audit complete by logging this one as is.
                     OVERFLOW.incrementAndGet();
-                    LOG.info(format(event, entity, op, path, detail, result, null));
+                    emit(format(event, entity, op, path, detail, result, null));
                     return;
                 }
                 counter = w.computeIfAbsent(key, k -> new Counter(now));
@@ -531,6 +580,88 @@ public final class ReadAuditLogger {
         } finally {
             SWAP_LOCK.readLock().unlock();
         }
+    }
+
+    // ---------------------------------------------------------------- queue and writer thread
+
+    /** Queues one audit line without ever blocking. A full queue drops and counts the line. */
+    private static void emit(String line) {
+        if (writer == null) {
+            startWriter();
+        }
+        PENDING.incrementAndGet();
+        if (!queue.offer(line)) {
+            PENDING.decrementAndGet();
+            countDrop();
+        }
+    }
+
+    private static void countDrop() {
+        DROPPED.increment();
+        FIRST_DROP.compareAndSet(0, System.currentTimeMillis());
+    }
+
+    private static synchronized void startWriter() {
+        if (writer != null) {
+            return;
+        }
+        Thread t = new Thread(ReadAuditLogger::writeLoop, "ReadAuditLogger-writer");
+        t.setDaemon(true);
+        t.start();
+        writer = t;
+    }
+
+    private static void writeLoop() {
+        long lastReport = System.currentTimeMillis();
+        while (true) {
+            try {
+                String line = queue.poll(100, TimeUnit.MILLISECONDS);
+                if (line != null) {
+                    try {
+                        LOG.info(line);
+                    } finally {
+                        PENDING.decrementAndGet();
+                    }
+                }
+                long now = System.currentTimeMillis();
+                // report drops once caught up, and at least once a second while they continue
+                if (queue.isEmpty() || now - lastReport >= 1000) {
+                    reportDrops(now);
+                    lastReport = now;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (Throwable t) {
+                INTERNAL_LOG.warn("Read audit writer failed to write a line", t);
+            }
+        }
+    }
+
+    private static void reportDrops(long now) {
+        long dropped = DROPPED.sumThenReset();
+        if (dropped == 0) {
+            return;
+        }
+        long since = FIRST_DROP.getAndSet(0);
+        // written directly by the writer thread, so the report itself can never be dropped
+        LOG.info("event=dropped count={} since={} until={}", dropped,
+                Instant.ofEpochMilli(since == 0 ? now : since), Instant.ofEpochMilli(now));
+    }
+
+    /**
+     * Waits until every queued line and any pending drop report has been handed to Logback.
+     * Visible for testing.
+     */
+    static boolean awaitDrained(long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (PENDING.get() > 0 || DROPPED.sum() > 0) {
+            if (System.currentTimeMillis() > deadline) {
+                return false;
+            }
+            Thread.sleep(5);
+        }
+        return true;
     }
 
     private static void flushSafely() {
@@ -563,11 +694,11 @@ public final class ReadAuditLogger {
             String agg = "count=" + v.count.sum()
                     + " first=" + Instant.ofEpochMilli(v.first)
                     + " last=" + Instant.ofEpochMilli(v.last.get());
-            LOG.info(format("aggregate source=" + k.event, k.entity, k.op, k.path, k.detail, k.result, agg));
+            emit(format("aggregate source=" + k.event, k.entity, k.op, k.path, k.detail, k.result, agg));
         }
         if (overflow > 0) {
-            LOG.info("event=aggregateOverflow windowStart={} windowEnd={} individuallyLogged={}",
-                    Instant.ofEpochMilli(start), Instant.ofEpochMilli(end), overflow);
+            emit("event=aggregateOverflow windowStart=" + Instant.ofEpochMilli(start) + " windowEnd="
+                    + Instant.ofEpochMilli(end) + " individuallyLogged=" + overflow);
         }
     }
 

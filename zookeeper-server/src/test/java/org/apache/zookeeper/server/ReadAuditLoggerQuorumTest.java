@@ -102,7 +102,7 @@ public class ReadAuditLoggerQuorumTest extends QuorumBase {
                 assertTrue(fired.await(10, TimeUnit.SECONDS));
                 Thread.sleep(300);
 
-                String out = tool.getOutputStream().toString();
+                String out = ReadAuditLoggerTest.out(tool);
                 String sess = "session=0x" + Long.toHexString(reader.getSessionId());
                 String reads = ReadAuditLoggerTest.grepLines(out, sess);
                 System.out.println("==== READ AUDIT LOG (" + state + " sid=" + served.getId() + ") ====\n" + reads + "==== END ====");
