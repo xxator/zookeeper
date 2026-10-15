@@ -1787,15 +1787,22 @@ public class DataTree {
         childWatches.removeWatcher(watcher);
     }
 
+    /** Sends a reconnecting client an event it missed while disconnected, and records it in the read audit log. */
+    private static void deliverMissedEvent(Watcher watcher, EventType type, String path) {
+        WatchedEvent event = new WatchedEvent(type, KeeperState.SyncConnected, path);
+        watcher.process(event);
+        ReadAuditLogger.logMissedWatchEvent(watcher, event);
+    }
+
     public void setWatches(long relativeZxid, List<String> dataWatches, List<String> existWatches, List<String> childWatches,
                            List<String> persistentWatches, List<String> persistentRecursiveWatches, Watcher watcher) {
         for (String path : dataWatches) {
             DataNode node = getNode(path);
             WatchedEvent e = null;
             if (node == null) {
-                watcher.process(new WatchedEvent(EventType.NodeDeleted, KeeperState.SyncConnected, path));
+                deliverMissedEvent(watcher, EventType.NodeDeleted, path);
             } else if (node.stat.getMzxid() > relativeZxid) {
-                watcher.process(new WatchedEvent(EventType.NodeDataChanged, KeeperState.SyncConnected, path));
+                deliverMissedEvent(watcher, EventType.NodeDataChanged, path);
             } else {
                 this.dataWatches.addWatch(path, watcher);
             }
@@ -1803,7 +1810,7 @@ public class DataTree {
         for (String path : existWatches) {
             DataNode node = getNode(path);
             if (node != null) {
-                watcher.process(new WatchedEvent(EventType.NodeCreated, KeeperState.SyncConnected, path));
+                deliverMissedEvent(watcher, EventType.NodeCreated, path);
             } else {
                 this.dataWatches.addWatch(path, watcher);
             }
@@ -1811,9 +1818,9 @@ public class DataTree {
         for (String path : childWatches) {
             DataNode node = getNode(path);
             if (node == null) {
-                watcher.process(new WatchedEvent(EventType.NodeDeleted, KeeperState.SyncConnected, path));
+                deliverMissedEvent(watcher, EventType.NodeDeleted, path);
             } else if (node.stat.getPzxid() > relativeZxid) {
-                watcher.process(new WatchedEvent(EventType.NodeChildrenChanged, KeeperState.SyncConnected, path));
+                deliverMissedEvent(watcher, EventType.NodeChildrenChanged, path);
             } else {
                 this.childWatches.addWatch(path, watcher);
             }

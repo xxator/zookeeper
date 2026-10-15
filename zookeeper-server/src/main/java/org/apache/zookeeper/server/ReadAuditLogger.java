@@ -23,9 +23,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -62,6 +64,8 @@ import org.slf4j.LoggerFactory;
  *   authenticated user + client IP, merging that client's sessions.</li>
  *   <li>{@code zookeeper.readAuditLog.aggregateMaxKeys} (default 10000): bound on distinct groups
  *   held per window. Events past the bound are logged individually so nothing is lost.</li>
+ *   <li>{@code zookeeper.readAuditLog.watchFiredMaxReaders} (default 1000): most readers listed on
+ *   one notification line. Readers past it are counted in {@code readersOmitted=}.</li>
  * </ul>
  *
  * <p>Uses the dedicated logger name {@value #LOGGER_NAME} so it can be routed to its own appender.
@@ -76,6 +80,9 @@ import org.slf4j.LoggerFactory;
  *   {@code pathPrefixes=/app/x}, a child watch on {@code /app} and its {@code NodeChildrenChanged}
  *   events are in scope, because they report creation and deletion of {@code /app/x}.</li>
  *   <li>Persistent recursive watches on an ancestor of a prefix are in scope.</li>
+ *   <li>Notifications are logged as one {@code event=watchFired} line per triggered event, listing
+ *   every reader it reached, not one line per watcher. {@code trigger=write} marks events fired by
+ *   a write, {@code trigger=reconnect} events sent to a reconnecting client by setWatches.</li>
  *   <li>A failed request whose path is unknown, such as a SESSIONMOVED rejection or a malformed
  *   request, is always logged, whatever the path filter.</li>
  *   <li>When a multi-path request fails as a whole, each of its paths is logged with the
@@ -90,6 +97,8 @@ public final class ReadAuditLogger {
     public static final String AGGREGATE_WINDOW_MS_PROPERTY = "zookeeper.readAuditLog.aggregateWindowMs";
     public static final String AGGREGATE_BY_PROPERTY = "zookeeper.readAuditLog.aggregateBy";
     public static final String AGGREGATE_MAX_KEYS_PROPERTY = "zookeeper.readAuditLog.aggregateMaxKeys";
+    public static final String WATCH_FIRED_MAX_READERS_PROPERTY = "zookeeper.readAuditLog.watchFiredMaxReaders";
+    static final int DEFAULT_WATCH_FIRED_MAX_READERS = 1000;
 
     private static final Logger LOG = LoggerFactory.getLogger(LOGGER_NAME);
     private static final Logger INTERNAL_LOG = LoggerFactory.getLogger(ReadAuditLogger.class);
@@ -147,13 +156,15 @@ public final class ReadAuditLogger {
         final long windowMs;
         final AggregateBy aggregateBy;
         final int maxKeys;
+        final int maxReaders;
 
-        Config(boolean enabled, List<String> prefixes, long windowMs, AggregateBy aggregateBy, int maxKeys) {
+        Config(boolean enabled, List<String> prefixes, long windowMs, AggregateBy aggregateBy, int maxKeys, int maxReaders) {
             this.enabled = enabled;
             this.prefixes = prefixes;
             this.windowMs = windowMs;
             this.aggregateBy = aggregateBy;
             this.maxKeys = maxKeys;
+            this.maxReaders = maxReaders;
         }
     }
 
@@ -188,7 +199,7 @@ public final class ReadAuditLogger {
                 return false;
             }
             Key k = (Key) o;
-            return hash == k.hash && event.equals(k.event) && entity.equals(k.entity)
+            return hash == k.hash && event.equals(k.event) && Objects.equals(entity, k.entity)
                     && Objects.equals(op, k.op) && Objects.equals(path, k.path)
                     && Objects.equals(detail, k.detail) && Objects.equals(result, k.result);
         }
@@ -260,7 +271,8 @@ public final class ReadAuditLogger {
                 parsePrefixes(System.getProperty(PATH_PREFIXES_PROPERTY, "")),
                 Long.getLong(AGGREGATE_WINDOW_MS_PROPERTY, 0L),
                 by,
-                Integer.getInteger(AGGREGATE_MAX_KEYS_PROPERTY, 10000));
+                Integer.getInteger(AGGREGATE_MAX_KEYS_PROPERTY, 10000),
+                Integer.getInteger(WATCH_FIRED_MAX_READERS_PROPERTY, DEFAULT_WATCH_FIRED_MAX_READERS));
     }
 
     static List<String> parsePrefixes(String value) {
@@ -286,10 +298,16 @@ public final class ReadAuditLogger {
     }
 
     /** Replaces the configuration. Flushes what the old configuration aggregated. Visible for testing. */
-    static synchronized void configure(boolean enabled, String prefixes, long windowMs, AggregateBy by, int maxKeys) {
+    static void configure(boolean enabled, String prefixes, long windowMs, AggregateBy by, int maxKeys) {
+        configure(enabled, prefixes, windowMs, by, maxKeys, DEFAULT_WATCH_FIRED_MAX_READERS);
+    }
+
+    /** Replaces the configuration, including the reader cap for notification lines. Visible for testing. */
+    static synchronized void configure(boolean enabled, String prefixes, long windowMs, AggregateBy by, int maxKeys,
+                                       int maxReaders) {
         stopFlusher();
         flush();
-        config = new Config(enabled, parsePrefixes(prefixes), windowMs, by, maxKeys);
+        config = new Config(enabled, parsePrefixes(prefixes), windowMs, by, maxKeys, maxReaders);
         logStatus(config);
         startFlusher(config);
     }
@@ -302,8 +320,8 @@ public final class ReadAuditLogger {
                     + " Set that logger to INFO in the logback configuration.", LOGGER_NAME);
         } else {
             INTERNAL_LOG.info("Read audit log active: logger={} pathPrefixes={} aggregateWindowMs={} aggregateBy={}"
-                    + " aggregateMaxKeys={}", LOGGER_NAME, c.prefixes.isEmpty() ? "all" : c.prefixes,
-                    c.windowMs, c.aggregateBy, c.maxKeys);
+                    + " aggregateMaxKeys={} watchFiredMaxReaders={}", LOGGER_NAME,
+                    c.prefixes.isEmpty() ? "all" : c.prefixes, c.windowMs, c.aggregateBy, c.maxKeys, c.maxReaders);
         }
     }
 
@@ -505,26 +523,116 @@ public final class ReadAuditLogger {
         }
     }
 
-    /** Logs a watch notification being delivered to a client connection. */
-    public static void logWatchFired(ServerCnxn cnxn, WatchedEvent event) {
+    /**
+     * Collects the readers notified by one triggered event, so the event is logged as a single
+     * summary line instead of one line per watcher. Not thread safe: one instance per trigger.
+     */
+    public static final class WatchFiredSummary {
+        private final Config c;
+        private final String path;
+        private final Watcher.Event.EventType type;
+        private final String trigger;
+        private final Set<String> readers = new LinkedHashSet<>();
+        private int watchers;
+        private int omitted;
+
+        private WatchFiredSummary(Config c, String path, Watcher.Event.EventType type, String trigger) {
+            this.c = c;
+            this.path = path;
+            this.type = type;
+            this.trigger = trigger;
+        }
+
+        /** Records one watcher the event was delivered to. Non-client watchers are ignored. */
+        public void add(Watcher watcher) {
+            if (!(watcher instanceof ServerCnxn)) {
+                return;
+            }
+            watchers++;
+            String reader = readerToken(c, (ServerCnxn) watcher);
+            if (readers.contains(reader)) {
+                return;
+            }
+            if (readers.size() >= c.maxReaders) {
+                omitted++;
+            } else {
+                readers.add(reader);
+            }
+        }
+
+        /** Writes the summary line, if the event reached at least one client. */
+        public void finish() {
+            if (watchers == 0) {
+                return;
+            }
+            StringBuilder detail = new StringBuilder(64 + readers.size() * 48);
+            detail.append("type=").append(type).append(" trigger=").append(trigger)
+                  .append(" watchers=").append(watchers).append(" readers=");
+            boolean first = true;
+            for (String r : readers) {
+                detail.append(first ? "" : ",").append(r);
+                first = false;
+            }
+            if (omitted > 0) {
+                detail.append(" readersOmitted=").append(omitted);
+            }
+            record(c, "watchFired", null, null, path, detail.toString(), null);
+        }
+    }
+
+    /**
+     * Starts a summary for an event fired by a write. Returns null when the audit is off or the
+     * path is out of scope, so callers pay nothing in that case.
+     */
+    public static WatchFiredSummary watchFired(String path, Watcher.Event.EventType type) {
+        return summary(path, type, "write");
+    }
+
+    /**
+     * Logs an event delivered directly to a reconnecting client by setWatches, because the watched
+     * znode changed while the client was disconnected.
+     */
+    public static void logMissedWatchEvent(Watcher watcher, WatchedEvent event) {
+        WatchFiredSummary summary = summary(event.getPath(), event.getType(), "reconnect");
+        if (summary != null) {
+            summary.add(watcher);
+            summary.finish();
+        }
+    }
+
+    private static WatchFiredSummary summary(String path, Watcher.Event.EventType type, String trigger) {
         Config c = config;
         if (!c.enabled || !LOG.isInfoEnabled()) {
-            return;
+            return null;
         }
         // NodeChildrenChanged carries the parent's path; on the direct parent it reports the prefix's creation/deletion
-        Scope scope = event.getType() == Watcher.Event.EventType.NodeChildrenChanged ? Scope.SUBTREE_OR_PARENT : Scope.SUBTREE;
-        if (!inScope(c.prefixes, event.getPath(), scope)) {
-            return;
+        Scope scope = type == Watcher.Event.EventType.NodeChildrenChanged ? Scope.SUBTREE_OR_PARENT : Scope.SUBTREE;
+        if (!inScope(c.prefixes, path, scope)) {
+            return null;
         }
+        return new WatchFiredSummary(c, path, type, trigger);
+    }
+
+    /**
+     * One notified reader: {@code <session>/<client ip:port>/<users>} by default, or
+     * {@code <users>/<client ip>} when aggregating by user. Users are joined with {@code +} so that
+     * {@code ,} can separate readers.
+     */
+    private static String readerToken(Config c, ServerCnxn cnxn) {
         StringBuilder users = new StringBuilder();
         for (Id id : cnxn.getAuthInfo()) {
             String user = AuthUtil.getUser(id);
             if (user != null) {
-                users.append(users.length() == 0 ? "" : ",").append(user);
+                users.append(users.length() == 0 ? "" : "+").append(user);
             }
         }
-        record(c, "watchFired", entity(c, cnxn.getSessionId(), cnxn, users.toString()), null, event.getPath(),
-                "type=" + event.getType(), null);
+        InetSocketAddress addr = cnxn.getRemoteSocketAddress();
+        String ip = addr == null ? "unknown" : addr.getAddress().getHostAddress();
+        if (c.aggregateBy == AggregateBy.USER && c.windowMs > 0) {
+            return users + "/" + ip;
+        }
+        String client = addr == null ? "unknown" : ip + ":" + addr.getPort();
+        return "0x" + Long.toHexString(cnxn.getSessionId()) + "/" + client + "/" + users;
     }
 
     // ---------------------------------------------------------------- recording and aggregation
@@ -609,7 +717,10 @@ public final class ReadAuditLogger {
     private static String format(String event, String entity, String op, String path, String detail,
                                  String result, String aggregate) {
         StringBuilder sb = new StringBuilder(160);
-        sb.append("event=").append(event).append(' ').append(entity);
+        sb.append("event=").append(event);
+        if (entity != null) {
+            sb.append(' ').append(entity);
+        }
         if (op != null) {
             sb.append(" op=").append(op);
         }

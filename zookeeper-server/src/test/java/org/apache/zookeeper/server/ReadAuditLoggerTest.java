@@ -180,7 +180,7 @@ public class ReadAuditLoggerTest extends ClientBase {
                 assertTrue(grepLines(grepLines(out, s1), "op=exists").contains("count=3 "));
                 assertTrue(grepLines(grepLines(out, s1), "watch=true").contains("count=1 "));
                 assertTrue(grepLines(grepLines(out, s2), "op=getData path=/app watch=false").contains("count=3 "));
-                assertTrue(grepLines(out, "source=watchFired").contains(s1));
+                assertTrue(grepLines(out, "source=watchFired").contains("readers=0x" + Long.toHexString(zk1.getSessionId()) + "/"));
                 assertEquals(5, countLines(out, "event=aggregate"));
             } finally {
                 zk1.close();
@@ -407,6 +407,97 @@ public class ReadAuditLoggerTest extends ClientBase {
                 ReadAuditLogger.watchModeDetail(org.apache.zookeeper.ZooDefs.AddWatchModes.persistentRecursive));
     }
 
+    private java.util.List<ZooKeeper> watchingClients(int n, String path) throws Exception {
+        java.util.List<ZooKeeper> zks = new java.util.ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            ZooKeeper zk = createClient();
+            zk.addWatch(path, e -> { }, AddWatchMode.PERSISTENT);
+            zks.add(zk);
+        }
+        return zks;
+    }
+
+    @Test
+    public void testFanOutIsOneSummaryLinePerWrite() throws Exception {
+        enable("/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+        try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.LOGGER_NAME)) {
+            ZooKeeper writer = createClient();
+            writer.create("/app", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            java.util.List<ZooKeeper> readers = watchingClients(5, "/app");
+            try {
+                writer.setData("/app", new byte[1], -1);
+                String out = waitFor(tool, "event=watchFired");
+                writer.setData("/app", new byte[2], -1);
+                out = waitFor(tool, "readers=");
+                Thread.sleep(300);
+                out = tool.getOutputStream().toString();
+                System.out.println("==== READ AUDIT LOG (fan-out summary) ====\n" + grepLines(out, "event=watchFired") + "==== END ====");
+                // one line per write, not one per watcher
+                assertEquals(2, countLines(out, "event=watchFired path=/app type=NodeDataChanged trigger=write watchers=5 readers="));
+                String line = grepLines(out, "event=watchFired").split("\n")[0];
+                for (ZooKeeper r : readers) {
+                    assertTrue(line, line.contains("0x" + Long.toHexString(r.getSessionId()) + "/127.0.0.1:"));
+                }
+                assertFalse(line.contains("readersOmitted"));
+            } finally {
+                for (ZooKeeper r : readers) {
+                    r.close();
+                }
+                writer.close();
+            }
+        }
+    }
+
+    @Test
+    public void testReaderListIsCapped() throws Exception {
+        ReadAuditLogger.configure(true, "/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000, 2);
+        try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.LOGGER_NAME)) {
+            ZooKeeper writer = createClient();
+            writer.create("/app", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            java.util.List<ZooKeeper> readers = watchingClients(5, "/app");
+            try {
+                writer.setData("/app", new byte[1], -1);
+                String line = grepLines(waitFor(tool, "event=watchFired"), "event=watchFired");
+                assertTrue(line, line.contains("watchers=5 "));
+                assertTrue(line, line.endsWith("readersOmitted=3\n"));
+                assertEquals(2, line.substring(line.indexOf("readers=")).split(" ")[0].split(",").length);
+            } finally {
+                for (ZooKeeper r : readers) {
+                    r.close();
+                }
+                writer.close();
+            }
+        }
+    }
+
+    @Test
+    public void testFanOutAggregatesAndDedupesByUser() throws Exception {
+        enable("/app", 3_600_000, ReadAuditLogger.AggregateBy.USER, 10000);
+        try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.LOGGER_NAME)) {
+            ZooKeeper writer = createClient();
+            writer.create("/app", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            java.util.List<ZooKeeper> readers = watchingClients(5, "/app");
+            try {
+                for (int i = 0; i < 3; i++) {
+                    writer.setData("/app", new byte[i], -1);
+                }
+                Thread.sleep(300);
+                ReadAuditLogger.flush();
+                String out = tool.getOutputStream().toString();
+                String line = grepLines(out, "source=watchFired");
+                System.out.println("==== READ AUDIT LOG (fan-out by user) ====\n" + line + "==== END ====");
+                // five sessions from the same user and IP collapse to one reader, and three writes to one line
+                assertEquals(1, countLines(out, "source=watchFired"));
+                assertTrue(line, line.contains("path=/app type=NodeDataChanged trigger=write watchers=5 readers=127.0.0.1/127.0.0.1 count=3 "));
+            } finally {
+                for (ZooKeeper r : readers) {
+                    r.close();
+                }
+                writer.close();
+            }
+        }
+    }
+
     @Test
     public void testFlusherThreadEmitsOnItsOwn() throws Exception {
         enable("/app", 500, ReadAuditLogger.AggregateBy.SESSION, 10000);
@@ -502,8 +593,8 @@ public class ReadAuditLoggerTest extends ClientBase {
                 assertTrue(out.contains("op=addWatch path=/audit watchMode=PERSISTENT_RECURSIVE result=OK"));
                 assertTrue(out.contains("op=checkWatches path=/audit watcherType=Any result=OK"));
                 assertTrue(out.contains("op=removeWatches path=/audit watcherType=Data result=OK"));
-                assertTrue(out.contains("event=watchFired session=0x" + Long.toHexString(zk.getSessionId())));
-                assertTrue(out.contains("path=/audit type=NodeDataChanged"));
+                assertTrue(out, out.contains("event=watchFired path=/audit type=NodeDataChanged trigger=write watchers=1 readers=0x"
+                        + Long.toHexString(zk.getSessionId()) + "/127.0.0.1:"));
                 assertTrue(out.contains("user=127.0.0.1"));
                 // writes are not part of this log
                 assertTrue(!out.contains("op=create") && !out.contains("op=setData"));

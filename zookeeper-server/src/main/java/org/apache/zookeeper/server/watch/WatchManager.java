@@ -29,6 +29,7 @@ import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.Watcher.Event.EventType;
 import org.apache.zookeeper.Watcher.Event.KeeperState;
+import org.apache.zookeeper.server.ReadAuditLogger;
 import org.apache.zookeeper.server.ServerCnxn;
 import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.ZooTrace;
@@ -161,11 +162,18 @@ public class WatchManager implements IWatchManager {
             return null;
         }
 
+        ReadAuditLogger.WatchFiredSummary audit = ReadAuditLogger.watchFired(path, type);
         for (Watcher w : watchers) {
             if (supress != null && supress.contains(w)) {
                 continue;
             }
             w.process(e);
+            if (audit != null) {
+                audit.add(w);
+            }
+        }
+        if (audit != null) {
+            audit.finish();
         }
 
         switch (type) {
