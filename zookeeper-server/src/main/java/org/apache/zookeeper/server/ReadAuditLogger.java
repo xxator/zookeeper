@@ -22,6 +22,7 @@ import java.net.InetSocketAddress;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -35,9 +36,12 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.zookeeper.KeeperException.Code;
 import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.WatcherType;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.server.util.AuthUtil;
+import org.apache.zookeeper.server.watch.WatcherMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,6 +65,22 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <p>Uses the dedicated logger name {@value #LOGGER_NAME} so it can be routed to its own appender.
+ * The logger must be at INFO or finer: routing it at WARN or above turns the audit off even when
+ * {@code enabled=true}. A status line in the main server log states whether the audit is active.
+ *
+ * <p>Field semantics and scope rules:
+ * <ul>
+ *   <li>{@code watch=true|false} is the watch flag the client sent, not whether a watch was set.
+ *   A getData that fails with NONODE or NOAUTH still logs {@code watch=true}.</li>
+ *   <li>Child watches and {@code NodeChildrenChanged} events carry the parent's path. With
+ *   {@code pathPrefixes=/app/x}, a child watch on {@code /app} and its {@code NodeChildrenChanged}
+ *   events are in scope, because they report creation and deletion of {@code /app/x}.</li>
+ *   <li>Persistent recursive watches on an ancestor of a prefix are in scope.</li>
+ *   <li>A failed request whose path is unknown, such as a SESSIONMOVED rejection or a malformed
+ *   request, is always logged, whatever the path filter.</li>
+ *   <li>When a multi-path request fails as a whole, each of its paths is logged with the
+ *   request's error, because the client received nothing.</li>
+ * </ul>
  */
 public final class ReadAuditLogger {
 
@@ -73,6 +93,35 @@ public final class ReadAuditLogger {
 
     private static final Logger LOG = LoggerFactory.getLogger(LOGGER_NAME);
     private static final Logger INTERNAL_LOG = LoggerFactory.getLogger(ReadAuditLogger.class);
+
+    public static final String WATCH_TRUE = "watch=true";
+    public static final String WATCH_FALSE = "watch=false";
+    static final String WATCH_TYPE_DATA = "watchType=data";
+    static final String WATCH_TYPE_EXIST = "watchType=exist";
+    static final String WATCH_TYPE_CHILD = "watchType=child";
+    static final String WATCH_TYPE_PERSISTENT = "watchType=persistent";
+    static final String WATCH_TYPE_PERSISTENT_RECURSIVE = "watchType=persistentRecursive";
+    private static final Map<WatcherType, String> WATCHER_TYPE_DETAILS = new EnumMap<>(WatcherType.class);
+    private static final Map<WatcherMode, String> WATCH_MODE_DETAILS = new EnumMap<>(WatcherMode.class);
+
+    static {
+        for (WatcherType t : WatcherType.values()) {
+            WATCHER_TYPE_DETAILS.put(t, "watcherType=" + t);
+        }
+        for (WatcherMode m : WatcherMode.values()) {
+            WATCH_MODE_DETAILS.put(m, "watchMode=" + m);
+        }
+    }
+
+    /** How far beyond the configured subtrees a path counts as in scope. */
+    enum Scope {
+        /** The prefix itself or a descendant. */
+        SUBTREE,
+        /** Also strict ancestors: a persistent recursive watch there covers the subtree. */
+        SUBTREE_OR_ANCESTOR,
+        /** Also the direct parent: its child watches report creation and deletion of the prefix. */
+        SUBTREE_OR_PARENT
+    }
 
     /** Grouping entity for aggregation. */
     public enum AggregateBy { SESSION, USER }
@@ -166,10 +215,34 @@ public final class ReadAuditLogger {
     private static ScheduledExecutorService flusher;
 
     static {
+        logStatus(config);
         startFlusher(config);
     }
 
     private ReadAuditLogger() {
+    }
+
+    /**
+     * Loads the configuration and logs whether the audit is active. Called when the request
+     * pipeline starts, after zoo.cfg has been parsed, so the status line appears at startup.
+     */
+    public static void init() {
+        // class initialization does the work
+    }
+
+    /** Detail for a request's watch flag. Returns a constant, so building it never allocates. */
+    public static String watchDetail(boolean watch) {
+        return watch ? WATCH_TRUE : WATCH_FALSE;
+    }
+
+    /** Detail for checkWatches and removeWatches. Returns a constant. */
+    public static String watcherTypeDetail(WatcherType type) {
+        return WATCHER_TYPE_DETAILS.get(type);
+    }
+
+    /** Detail for addWatch. Returns a constant. */
+    public static String watchModeDetail(int zooDefMode) {
+        return WATCH_MODE_DETAILS.get(WatcherMode.fromZooDef(zooDefMode));
     }
 
     // ---------------------------------------------------------------- configuration
@@ -217,12 +290,25 @@ public final class ReadAuditLogger {
         stopFlusher();
         flush();
         config = new Config(enabled, parsePrefixes(prefixes), windowMs, by, maxKeys);
+        logStatus(config);
         startFlusher(config);
+    }
+
+    private static void logStatus(Config c) {
+        if (!c.enabled) {
+            INTERNAL_LOG.info("Read audit log disabled. Set {}=true to enable it.", ENABLED_PROPERTY);
+        } else if (!LOG.isInfoEnabled()) {
+            INTERNAL_LOG.warn("Read audit log is enabled but logger {} is not at INFO, so nothing will be logged."
+                    + " Set that logger to INFO in the logback configuration.", LOGGER_NAME);
+        } else {
+            INTERNAL_LOG.info("Read audit log active: logger={} pathPrefixes={} aggregateWindowMs={} aggregateBy={}"
+                    + " aggregateMaxKeys={}", LOGGER_NAME, c.prefixes.isEmpty() ? "all" : c.prefixes,
+                    c.windowMs, c.aggregateBy, c.maxKeys);
+        }
     }
 
     private static synchronized void startFlusher(Config c) {
         if (c.enabled && c.windowMs > 0) {
-            INTERNAL_LOG.info("Read audit log aggregating every {} ms by {}, prefixes={}", c.windowMs, c.aggregateBy, c.prefixes);
             flusher = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "ReadAuditLogger-flusher");
                 t.setDaemon(true);
@@ -266,6 +352,62 @@ public final class ReadAuditLogger {
             }
         }
         return false;
+    }
+
+    /** True if the path is the direct parent of a configured znode, e.g. /app for /app/x. */
+    static boolean pathIsParent(List<String> prefixes, String path) {
+        if (path == null) {
+            return false;
+        }
+        for (String p : prefixes) {
+            int slash = p.lastIndexOf('/');
+            if (slash >= 0 && !p.equals("/") && path.equals(slash == 0 ? "/" : p.substring(0, slash))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean inScope(List<String> prefixes, String path, Scope scope) {
+        if (pathMatches(prefixes, path)) {
+            return true;
+        }
+        switch (scope) {
+        case SUBTREE_OR_ANCESTOR:
+            return pathIsAncestor(prefixes, path);
+        case SUBTREE_OR_PARENT:
+            return pathIsParent(prefixes, path);
+        default:
+            return false;
+        }
+    }
+
+    /** Scope of a single-path request, from its type and watch detail. */
+    private static Scope requestScope(int type, String detail) {
+        switch (type) {
+        case OpCode.addWatch:
+            if (WATCH_MODE_DETAILS.get(WatcherMode.PERSISTENT_RECURSIVE).equals(detail)) {
+                return Scope.SUBTREE_OR_ANCESTOR;
+            }
+            return WATCH_MODE_DETAILS.get(WatcherMode.PERSISTENT).equals(detail) ? Scope.SUBTREE_OR_PARENT : Scope.SUBTREE;
+        case OpCode.getChildren:
+        case OpCode.getChildren2:
+        case OpCode.getChildrenPaginated:
+            return WATCH_TRUE.equals(detail) ? Scope.SUBTREE_OR_PARENT : Scope.SUBTREE;
+        default:
+            return Scope.SUBTREE;
+        }
+    }
+
+    /** Scope of one re-registered watch from setWatches. */
+    private static Scope entryScope(String detail) {
+        if (WATCH_TYPE_PERSISTENT_RECURSIVE.equals(detail)) {
+            return Scope.SUBTREE_OR_ANCESTOR;
+        }
+        if (WATCH_TYPE_CHILD.equals(detail) || WATCH_TYPE_PERSISTENT.equals(detail)) {
+            return Scope.SUBTREE_OR_PARENT;
+        }
+        return Scope.SUBTREE;
     }
 
     /** True if the path is a strict ancestor of a configured znode, e.g. a recursive watch on / covers /app. */
@@ -319,25 +461,27 @@ public final class ReadAuditLogger {
         if (!c.enabled || !LOG.isInfoEnabled() || !isReadOrWatchOp(request.type)) {
             return;
         }
-        String entity = null;
-        if (entries == null) {
-            boolean recursiveWatch = request.type == OpCode.addWatch && detail != null && detail.contains("RECURSIVE");
-            if (!pathMatches(c.prefixes, path) && !(recursiveWatch && pathIsAncestor(c.prefixes, path))) {
+        if (entries == null || (entries.isEmpty() && err != Code.OK)) {
+            // a failure with no known path, e.g. SESSIONMOVED or a malformed request, is always logged
+            boolean unknownPathFailure = path == null && err != Code.OK;
+            if (!unknownPathFailure && !inScope(c.prefixes, path, requestScope(request.type, detail))) {
                 return;
             }
-            entity = entity(c, request.sessionId, cnxn, request.getUsers());
-            record(c, "request", entity, opName(request.type), path, detail, err.name());
+            record(c, "request", entity(c, request.sessionId, cnxn, request.getUsers()),
+                    opName(request.type), path, detail, err.name());
             return;
         }
+        String entity = null;
         for (Entry e : entries) {
-            boolean recursiveWatch = e.detail != null && e.detail.contains("persistentRecursive");
-            if (!pathMatches(c.prefixes, e.path) && !(recursiveWatch && pathIsAncestor(c.prefixes, e.path))) {
+            if (!inScope(c.prefixes, e.path, entryScope(e.detail))) {
                 continue;
             }
             if (entity == null) {
                 entity = entity(c, request.sessionId, cnxn, request.getUsers());
             }
-            record(c, "request", entity, e.op, e.path, e.detail, (e.result == null ? err : e.result).name());
+            // when the whole request failed the client received nothing, so every path gets that error
+            Code result = err != Code.OK || e.result == null ? err : e.result;
+            record(c, "request", entity, e.op, e.path, e.detail, result.name());
         }
     }
 
@@ -345,18 +489,18 @@ public final class ReadAuditLogger {
     public static List<Entry> setWatchesEntries(String op, List<String> data, List<String> exist, List<String> child,
                                                 List<String> persistent, List<String> persistentRecursive) {
         List<Entry> entries = new ArrayList<>();
-        addWatchEntries(entries, op, "data", data);
-        addWatchEntries(entries, op, "exist", exist);
-        addWatchEntries(entries, op, "child", child);
-        addWatchEntries(entries, op, "persistent", persistent);
-        addWatchEntries(entries, op, "persistentRecursive", persistentRecursive);
+        addWatchEntries(entries, op, WATCH_TYPE_DATA, data);
+        addWatchEntries(entries, op, WATCH_TYPE_EXIST, exist);
+        addWatchEntries(entries, op, WATCH_TYPE_CHILD, child);
+        addWatchEntries(entries, op, WATCH_TYPE_PERSISTENT, persistent);
+        addWatchEntries(entries, op, WATCH_TYPE_PERSISTENT_RECURSIVE, persistentRecursive);
         return entries;
     }
 
-    private static void addWatchEntries(List<Entry> entries, String op, String type, List<String> paths) {
+    private static void addWatchEntries(List<Entry> entries, String op, String detail, List<String> paths) {
         if (paths != null) {
             for (String p : paths) {
-                entries.add(new Entry(op, p, "watchType=" + type, null));
+                entries.add(new Entry(op, p, detail, null));
             }
         }
     }
@@ -364,7 +508,12 @@ public final class ReadAuditLogger {
     /** Logs a watch notification being delivered to a client connection. */
     public static void logWatchFired(ServerCnxn cnxn, WatchedEvent event) {
         Config c = config;
-        if (!c.enabled || !LOG.isInfoEnabled() || !pathMatches(c.prefixes, event.getPath())) {
+        if (!c.enabled || !LOG.isInfoEnabled()) {
+            return;
+        }
+        // NodeChildrenChanged carries the parent's path; on the direct parent it reports the prefix's creation/deletion
+        Scope scope = event.getType() == Watcher.Event.EventType.NodeChildrenChanged ? Scope.SUBTREE_OR_PARENT : Scope.SUBTREE;
+        if (!inScope(c.prefixes, event.getPath(), scope)) {
             return;
         }
         StringBuilder users = new StringBuilder();

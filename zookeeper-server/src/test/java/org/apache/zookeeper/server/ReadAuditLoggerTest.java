@@ -76,6 +76,10 @@ public class ReadAuditLoggerTest extends ClientBase {
         assertTrue(ReadAuditLogger.pathMatches(ReadAuditLogger.parsePrefixes(""), "/anything"));
         assertTrue(ReadAuditLogger.pathMatches(ReadAuditLogger.parsePrefixes("/"), "/anything"));
         assertTrue(ReadAuditLogger.pathIsAncestor(p, "/"));
+        assertTrue(ReadAuditLogger.pathIsParent(ReadAuditLogger.parsePrefixes("/app/x"), "/app"));
+        assertTrue(ReadAuditLogger.pathIsParent(ReadAuditLogger.parsePrefixes("/app"), "/"));
+        assertFalse(ReadAuditLogger.pathIsParent(ReadAuditLogger.parsePrefixes("/app/x"), "/"));
+        assertFalse(ReadAuditLogger.pathIsParent(ReadAuditLogger.parsePrefixes("/"), "/"));
         assertFalse(ReadAuditLogger.pathIsAncestor(p, "/app"));
         assertFalse(ReadAuditLogger.pathIsAncestor(p, "/ap"));
     }
@@ -331,6 +335,76 @@ public class ReadAuditLoggerTest extends ClientBase {
                 anon.close();
             }
         }
+    }
+
+    @Test
+    public void testChildWatchOnDirectParentIsInScope() throws Exception {
+        enable("/app/x", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+        try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.LOGGER_NAME)) {
+            ZooKeeper reader = createClient();
+            ZooKeeper writer = createClient();
+            try {
+                writer.create("/app", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                CountDownLatch appChildren = new CountDownLatch(1);
+                CountDownLatch rootChildren = new CountDownLatch(1);
+                reader.getChildren("/app", e -> appChildren.countDown());
+                reader.getChildren("/", e -> rootChildren.countDown());
+                reader.getChildren("/app", false);
+                reader.addWatch("/app", AddWatchMode.PERSISTENT);
+                reader.addWatch("/", AddWatchMode.PERSISTENT);
+
+                writer.create("/app/x", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                writer.create("/zzz", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                assertTrue(appChildren.await(10, TimeUnit.SECONDS));
+                assertTrue(rootChildren.await(10, TimeUnit.SECONDS));
+                Thread.sleep(300);
+                String out = tool.getOutputStream().toString();
+                System.out.println("==== READ AUDIT LOG (prefix /app/x, parent scope) ====\n" + out + "==== END ====");
+
+                // a child watch on /app reports creation and deletion of /app/x
+                assertEquals(1, countLines(out, "op=getChildren path=/app watch=true result=OK"));
+                assertEquals(1, countLines(out, "op=addWatch path=/app watchMode=PERSISTENT result=OK"));
+                assertTrue(out.contains("path=/app type=NodeChildrenChanged"));
+                // a plain listing of /app without a watch is not about /app/x
+                assertEquals(0, countLines(out, "op=getChildren path=/app watch=false"));
+                // the root is not the direct parent of /app/x
+                assertFalse(out.contains("path=/ "));
+            } finally {
+                reader.close();
+                writer.close();
+            }
+        }
+    }
+
+    @Test
+    public void testStatusLineReportsWhetherAuditIsActive() throws Exception {
+        ch.qos.logback.classic.Logger auditLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ReadAuditLogger.LOGGER_NAME);
+        ch.qos.logback.classic.Level original = auditLogger.getLevel();
+        try (LoggerTestTool tool = new LoggerTestTool(ReadAuditLogger.class)) {
+            enable("/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+            String out = tool.getOutputStream().toString();
+            assertTrue(out, out.contains("Read audit log active: logger=" + ReadAuditLogger.LOGGER_NAME + " pathPrefixes=[/app]"));
+
+            auditLogger.setLevel(ch.qos.logback.classic.Level.WARN);
+            enable("/app", 0, ReadAuditLogger.AggregateBy.SESSION, 10000);
+            out = tool.getOutputStream().toString();
+            assertTrue(out, out.contains("is not at INFO, so nothing will be logged"));
+            assertFalse(ReadAuditLogger.isEnabled());
+        } finally {
+            auditLogger.setLevel(original);
+        }
+    }
+
+    @Test
+    public void testDetailsAreConstants() {
+        assertTrue(ReadAuditLogger.watchDetail(true) == ReadAuditLogger.watchDetail(true));
+        assertEquals("watch=false", ReadAuditLogger.watchDetail(false));
+        assertTrue(ReadAuditLogger.watcherTypeDetail(Watcher.WatcherType.Data)
+                == ReadAuditLogger.watcherTypeDetail(Watcher.WatcherType.Data));
+        assertEquals("watcherType=Children", ReadAuditLogger.watcherTypeDetail(Watcher.WatcherType.Children));
+        assertEquals("watchMode=PERSISTENT_RECURSIVE",
+                ReadAuditLogger.watchModeDetail(org.apache.zookeeper.ZooDefs.AddWatchModes.persistentRecursive));
     }
 
     @Test
