@@ -236,6 +236,10 @@ public final class ServerMetrics {
         TLS_HANDSHAKE_EXCEEDED = metricsContext.getCounter("tls_handshake_exceeded");
 
         JVM_PAUSE_TIME = metricsContext.getSummary("jvm_pause_time_ms", DetailLevel.ADVANCED);
+
+        READ_AUDIT_LINES = metricsContext.getCounter("read_audit_lines");
+        READ_AUDIT_DROPPED = metricsContext.getCounter("read_audit_dropped");
+        READ_AUDIT_HOOK_TIME = metricsContext.getSummary("read_audit_hook_time_us", DetailLevel.BASIC);
     }
 
     /**
@@ -455,6 +459,22 @@ public final class ServerMetrics {
     public final Counter TLS_HANDSHAKE_EXCEEDED;
 
     public final Summary JVM_PAUSE_TIME;
+
+    /**
+     * Read audit lines the writer thread handed to the logger, including aggregate and overflow
+     * lines. The event=dropped reports are not counted.
+     */
+    public final Counter READ_AUDIT_LINES;
+
+    /** Read audit lines dropped because the audit queue was full. */
+    public final Counter READ_AUDIT_DROPPED;
+
+    /**
+     * Time, in microseconds, that request threads spend in the read audit hook while the audit is
+     * enabled: filtering, formatting, and queuing the line. Each read or watch request is one sample,
+     * including requests the path filter skips. The writer and flush threads are not included.
+     */
+    public final Summary READ_AUDIT_HOOK_TIME;
 
     private final MetricsProvider metricsProvider;
 
